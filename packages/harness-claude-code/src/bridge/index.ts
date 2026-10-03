@@ -144,6 +144,8 @@ const mcpModule = mcpServerModule as any;
  * so the latest observation is the one a later resume must name.
  */
 let lastClaudeSessionId: string | undefined;
+/** Tasks the CLI started this session; see `ClaudeStreamEventState.childTaskIds`. */
+const childTaskIds = new Set<string>();
 
 await runBridge<StartMessage>({
   bridgeType: 'claude-code',
@@ -388,7 +390,7 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
     turn.abortSignal.addEventListener('abort', onHostAbort, { once: true });
   }
 
-  const streamEventState = createClaudeStreamEventState();
+  const streamEventState = createClaudeStreamEventState({ childTaskIds });
 
   const mcpServers: Record<string, unknown> = { ...start.mcpServers };
   if (start.tools && start.tools.length > 0) {
