@@ -873,6 +873,64 @@ describe('createEmitStreamEvent', () => {
     expect(emitted).toEqual([{ type: 'stream-start' }]);
   });
 
+  it('forwards a failed background task as a raw part without ending the turn', () => {
+    const terminalErrors: Array<string | undefined> = [];
+    const emitted: Record<string, unknown>[] = [];
+    const emitStreamEvent = createEmitStreamEvent({
+      state: createClaudeStreamEventState(),
+      emit: event => emitted.push(event),
+      emitWarning: () => {},
+      emitTerminalError: error => terminalErrors.push(error),
+      onCompactionBoundary: () => {},
+      toCommonName: name => name,
+    });
+
+    const started: ClaudeMessage = {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'a1',
+    };
+    const failed: ClaudeMessage = {
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'a1',
+      patch: { status: 'failed', error: 'subagent failed' },
+    };
+    emitStreamEvent(started);
+    emitStreamEvent(failed);
+
+    expect(terminalErrors).toEqual([]);
+    expect(emitted).toEqual([
+      { type: 'stream-start' },
+      { type: 'raw', rawValue: started },
+      { type: 'raw', rawValue: failed },
+    ]);
+  });
+
+  it('remembers child tasks across turns that share their id set', () => {
+    const childTaskIds = new Set<string>();
+    const terminalErrors: Array<string | undefined> = [];
+    const createEmitter = () =>
+      createEmitStreamEvent({
+        state: createClaudeStreamEventState({ childTaskIds }),
+        emit: () => {},
+        emitWarning: () => {},
+        emitTerminalError: error => terminalErrors.push(error),
+        onCompactionBoundary: () => {},
+        toCommonName: name => name,
+      });
+
+    createEmitter()({ type: 'system', subtype: 'task_started', task_id: 'b1' });
+    createEmitter()({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'b1',
+      patch: { status: 'failed', error: 'shell failed' },
+    });
+
+    expect(terminalErrors).toEqual([]);
+  });
+
   it('preserves retry and compaction handling', () => {
     const state = createClaudeStreamEventState();
     const warnings: unknown[] = [];

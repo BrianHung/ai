@@ -12,6 +12,7 @@ export type ClaudeMessage = {
   attempt?: number;
   max_retries?: number;
   retry_delay_ms?: number;
+  task_id?: string;
   patch?: { status?: string; error?: string };
   compact_metadata?: {
     trigger: 'manual' | 'auto';
@@ -90,6 +91,13 @@ export type ClaudeStreamEventState = {
   mcpToolUseIds: Set<string>;
   externalMcpToolUseIds: Set<string>;
   structuredOutputToolUseIds: Set<string>;
+  /*
+   * Ids of tasks the CLI announced with `task_started`: subagents, background
+   * shells, workflows. They run beside the main query, so a failure of one is
+   * reported to the main agent (as a task notification) rather than ending the
+   * turn. Shared across turns, since a background task can outlive its turn.
+   */
+  childTaskIds: Set<string>;
   observedTerminalError: string | undefined;
 };
 
@@ -97,7 +105,9 @@ type PartialBlock =
   | { id: string; kind: 'text' | 'thinking' }
   | { id: string; kind: 'tool-input' };
 
-export function createClaudeStreamEventState(): ClaudeStreamEventState {
+export function createClaudeStreamEventState({
+  childTaskIds = new Set(),
+}: { childTaskIds?: Set<string> } = {}): ClaudeStreamEventState {
   return {
     nativeToolCallNames: new Map(),
     approvalRequestedToolUseIds: new Set(),
@@ -112,6 +122,7 @@ export function createClaudeStreamEventState(): ClaudeStreamEventState {
     mcpToolUseIds: new Set(),
     externalMcpToolUseIds: new Set(),
     structuredOutputToolUseIds: new Set(),
+    childTaskIds,
     observedTerminalError: undefined,
   };
 }
@@ -203,9 +214,22 @@ export function createEmitStreamEvent({
 
     if (
       type === 'system' &&
+      msg.subtype === 'task_started' &&
+      typeof msg.task_id === 'string'
+    ) {
+      state.childTaskIds.add(msg.task_id);
+    }
+
+    // A failed child task (a background subagent, say) is not a failure of
+    // the turn: the main agent is notified and carries on, so it is forwarded
+    // as a raw task part below. Only a failure of a task this bridge did not
+    // see start is treated as terminal.
+    if (
+      type === 'system' &&
       msg.subtype === 'task_updated' &&
       msg.patch?.status === 'failed' &&
-      typeof msg.patch.error === 'string'
+      typeof msg.patch.error === 'string' &&
+      !(typeof msg.task_id === 'string' && state.childTaskIds.has(msg.task_id))
     ) {
       emitTerminalError(msg.patch.error);
       return;
