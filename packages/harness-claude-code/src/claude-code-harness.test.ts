@@ -525,6 +525,48 @@ describe('createClaudeCode adapter', () => {
     await session.doDestroy();
   });
 
+  it('asks the bridge for a persistent query and routes between-turn parts to the callback', async () => {
+    const background: unknown[] = [];
+    const harness = createClaudeCode({
+      experimental_persistentSession: true,
+      experimental_onBackgroundPart: event => background.push(event),
+    });
+    const session = await harness.doStart({
+      sessionId: 's1',
+      sandboxSession: fakeNetworkSandboxSessionForStartupSuccess({
+        bridgePortUrl: 'ws://127.0.0.1:1',
+        writes: [],
+        runs: [],
+      }),
+      sessionWorkDir: '/vercel/sandbox/claude-code-s1',
+    });
+
+    const turnParts: Array<Record<string, unknown>> = [];
+    const control = await session.doPromptTurn({
+      skills: [],
+      tools: [],
+      prompt: 'Hello',
+      emit: part => turnParts.push(part as Record<string, unknown>),
+    });
+    expect(lastStart()).toMatchObject({ persistentQuery: true });
+
+    const during = { type: 'raw', rawValue: { subtype: 'task_started' } };
+    dispatchChannelEvent(during);
+    dispatchChannelEvent({ type: 'finish' });
+    await control.done;
+    const after = { type: 'raw', rawValue: { subtype: 'task_notification' } };
+    dispatchChannelEvent(after);
+
+    expect(turnParts).toContainEqual(during);
+    expect(background).toEqual([
+      {
+        sessionId: 's1',
+        part: { type: 'raw', rawValue: { subtype: 'task_notification' } },
+      },
+    ]);
+    await session.doDestroy();
+  });
+
   it('sets the client app for AI Gateway auth', async () => {
     const spawnEnvs: Array<Record<string, string | undefined>> = [];
     const harness = createClaudeCode({

@@ -52,6 +52,13 @@ export const startMessageSchema = harnessV1BridgeStartBaseSchema.extend({
   // a resume that itself started a new thread. Mutually exclusive with
   // `continue` in the SDK, so the bridge sends one or the other.
   resumeSessionId: z.string().optional(),
+  // Keep one Claude Code process alive across turns: the bridge feeds each
+  // turn's prompt into a single streaming-input query instead of starting and
+  // closing a query per turn, so background shells and subagents outlive the
+  // turn that launched them. Between turns the bridge forwards the query's
+  // messages as `raw` parts. A turn whose other options differ from the live
+  // query's replaces it, resuming the same conversation.
+  persistentQuery: z.boolean().optional(),
 });
 
 export type StartMessage = z.infer<typeof startMessageSchema>;

@@ -153,6 +153,30 @@ export type ClaudeCodeHarnessSettings = {
    * a random 32-byte hexadecimal token.
    */
   readonly mintBridgeToken?: HarnessV1MintBridgeTokenCallback;
+  /**
+   * Keeps one Claude Code process alive for the whole session instead of one
+   * per turn. Each turn's prompt is fed into a single streaming-input query,
+   * so background shells and subagents keep running after the turn that
+   * launched them ends, and report their progress and results later. The
+   * process ends when the session is stopped or destroyed, or when a turn
+   * changes an option the query was opened with (it is then replaced, resuming
+   * the same conversation).
+   *
+   * Between turns the query's messages arrive through
+   * {@link experimental_onBackgroundPart}; without that callback they are
+   * delivered as `raw` parts at the start of the next turn.
+   */
+  readonly experimental_persistentSession?: boolean;
+  /**
+   * Receives the `raw` parts a persistent session's bridge forwards while no
+   * turn is running: background task lifecycle and subagent messages, and the
+   * messages of a turn the CLI starts on its own to answer a task
+   * notification. Each part carries the Agent SDK message as `rawValue`.
+   */
+  readonly experimental_onBackgroundPart?: (event: {
+    sessionId: string;
+    part: { type: 'raw'; rawValue: unknown };
+  }) => void;
 };
 
 /*
@@ -1048,6 +1072,8 @@ export function createClaudeCode(
             maxTurns: settings.maxTurns,
             agentProgressSummaries: settings.agentProgressSummaries,
             forwardSubagentText: settings.forwardSubagentText,
+            persistentQuery: settings.experimental_persistentSession === true,
+            onBackgroundPart: settings.experimental_onBackgroundPart,
             env: sandboxClaudeEnvironment,
             thinking,
             effort: settings.effort,
@@ -1211,6 +1237,8 @@ export function createClaudeCode(
         maxTurns: settings.maxTurns,
         agentProgressSummaries: settings.agentProgressSummaries,
         forwardSubagentText: settings.forwardSubagentText,
+        persistentQuery: settings.experimental_persistentSession === true,
+        onBackgroundPart: settings.experimental_onBackgroundPart,
         env: sandboxClaudeEnvironment,
         thinking,
         effort: settings.effort,
@@ -1529,6 +1557,8 @@ function createSession({
   maxTurns,
   agentProgressSummaries,
   forwardSubagentText,
+  persistentQuery,
+  onBackgroundPart,
   env,
   thinking,
   effort,
@@ -1556,6 +1586,8 @@ function createSession({
   maxTurns: number | undefined;
   agentProgressSummaries: boolean | undefined;
   forwardSubagentText: boolean | undefined;
+  persistentQuery: boolean;
+  onBackgroundPart: ClaudeCodeHarnessSettings['experimental_onBackgroundPart'];
   env: Readonly<Record<string, string>> | undefined;
   thinking: ClaudeCodeThinkingConfig;
   effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined;
@@ -1600,6 +1632,28 @@ function createSession({
   let lastClaudeSessionId = resumeSessionId;
 
   /*
+   * True while a turn's listeners are wired. A persistent session's bridge
+   * keeps forwarding `raw` parts between turns; with a background callback
+   * they are handed to it as they arrive. Without one, they stay buffered in
+   * the channel and reach the next turn's stream first.
+   */
+  let turnWired = false;
+  if (persistentQuery && onBackgroundPart != null) {
+    channel.on('raw', msg => {
+      if (turnWired) return;
+      try {
+        onBackgroundPart({
+          sessionId,
+          part: {
+            type: 'raw',
+            rawValue: (msg as { rawValue?: unknown }).rawValue,
+          },
+        });
+      } catch {}
+    });
+  }
+
+  /*
    * Wire the channel into one turn's worth of events and return the control
    * surface. Shared by `doPromptTurn` (which sends a `start` afterwards) and
    * `doContinueTurn` (which attaches to an already-running/replayed turn, or sends
@@ -1631,9 +1685,11 @@ function createSession({
     };
 
     let isSettled = false;
+    turnWired = true;
     const settleSuccess = () => {
       if (isSettled) return;
       isSettled = true;
+      turnWired = false;
       userMessageSubmitter?.close();
       for (const u of unsubs) u();
       pendingResolve!();
@@ -1641,6 +1697,7 @@ function createSession({
     const settleError = (err: unknown) => {
       if (isSettled) return;
       isSettled = true;
+      turnWired = false;
       userMessageSubmitter?.close(err);
       for (const u of unsubs) u();
       pendingReject!(err);
@@ -1833,6 +1890,7 @@ function createSession({
           ? { agentProgressSummaries }
           : {}),
         ...(forwardSubagentText !== undefined ? { forwardSubagentText } : {}),
+        ...(persistentQuery ? { persistentQuery: true } : {}),
         ...(env !== undefined ? { env } : {}),
         thinking,
         ...(effort !== undefined ? { effort } : {}),
@@ -1901,6 +1959,7 @@ function createSession({
             ? { agentProgressSummaries }
             : {}),
           ...(forwardSubagentText !== undefined ? { forwardSubagentText } : {}),
+          ...(persistentQuery ? { persistentQuery: true } : {}),
           ...(env !== undefined ? { env } : {}),
           thinking,
           ...(effort !== undefined ? { effort } : {}),

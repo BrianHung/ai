@@ -116,6 +116,25 @@ export function createClaudeStreamEventState(): ClaudeStreamEventState {
   };
 }
 
+/**
+ * Clear the step and error bookkeeping of a finished turn, for a query that
+ * serves several turns. Tool name and id maps are kept: a tool call (a
+ * background subagent's, say) can settle in a later turn than it started.
+ */
+export function resetClaudeStreamEventTurnState(
+  state: ClaudeStreamEventState,
+): void {
+  state.partialBlocks.clear();
+  state.stepUsage = undefined;
+  state.pendingStepToolUseIds.clear();
+  state.pendingStepAssistantUsage = undefined;
+  state.pendingStepDeltaUsage = undefined;
+  state.pendingStepUsage = undefined;
+  state.pendingResponseUsage = undefined;
+  state.stepOpen = false;
+  state.observedTerminalError = undefined;
+}
+
 const UNRECOVERABLE_API_RETRY_STATUSES = new Set([401, 403, 404]);
 const HOST_TOOL_PREFIX = 'mcp__harness-tools__';
 const RAW_TASK_MESSAGE_SUBTYPES = new Set([

@@ -11,7 +11,11 @@ import {
   type Experimental_BridgeUserMessage,
   type Experimental_BridgeUserMessageQueue,
 } from '@ai-sdk/harness/bridge';
-import { createCompactionLatch } from './compaction-latch';
+import {
+  createCompactionLatch,
+  type CompactionLatch,
+} from './compaction-latch';
+import { createPushableInput, type PushableInput } from './pushable-input';
 import type { StartMessage } from '../claude-code-bridge-protocol';
 import { randomUUID } from 'node:crypto';
 import { argv, env as procEnv, stdout } from 'node:process';
@@ -49,7 +53,9 @@ import {
   finishApprovalStep,
   isExternalMcpTool,
   mapUsage,
+  resetClaudeStreamEventTurnState,
   type ClaudeMessage,
+  type ClaudeStreamEventState,
 } from './create-emit-stream-event';
 import { jsonSchemaToZodObject } from './json-schema-to-zod';
 import {
@@ -145,15 +151,35 @@ const mcpModule = mcpServerModule as any;
  */
 let lastClaudeSessionId: string | undefined;
 
+/**
+ * The long-lived query that `persistentQuery` turns share: one Claude Code
+ * process for the bridge, fed one user message per turn, so background shells
+ * and subagents keep running between turns. Undefined until the first
+ * persistent turn, and again once that query ends or is replaced.
+ */
+let liveQuery: LiveQuery | undefined;
+
 await runBridge<StartMessage>({
   bridgeType: 'claude-code',
   bridgeStateDir,
-  onStart: runTurn,
+  onStart: (start, turn) => {
+    if (start.persistentQuery === true) {
+      return runPersistentTurn(start, turn);
+    }
+    // A per-turn query must not share the conversation with a live one.
+    closeLiveQuery();
+    return runTurn(start, turn);
+  },
   // Claude Code's conversation state lives in the runtime's own store, keyed
   // by working directory. The resume payload names the exact conversation so a
   // later resume does not have to fall back to "most recent in this workdir".
-  onStop: () =>
-    lastClaudeSessionId == null ? {} : { claudeSessionId: lastClaudeSessionId },
+  onStop: () => {
+    closeLiveQuery();
+    return lastClaudeSessionId == null
+      ? {}
+      : { claudeSessionId: lastClaudeSessionId };
+  },
+  onDestroy: () => closeLiveQuery(),
 });
 
 type Emit = (msg: Record<string, unknown>) => void;
@@ -161,7 +187,7 @@ type Emit = (msg: Record<string, unknown>) => void;
 function createPermissionOptions(input: {
   start: StartMessage;
   inactiveNativeTools: readonly string[];
-  turn: BridgeTurn;
+  turn: Pick<BridgeTurn, 'requestToolApproval'>;
   emit: Emit;
   finishApprovalStep: (approvalId: string) => void;
   nativeToolCallNames: Map<string, string>;
@@ -250,7 +276,7 @@ function createPermissionOptions(input: {
 }
 
 function createQuestionPreToolUseHook(input: {
-  turn: BridgeTurn;
+  turn: Pick<BridgeTurn, 'requestToolResult'>;
   emit: Emit;
   nativeToolCallNames: Map<string, string>;
 }): HookCallback {
@@ -359,6 +385,184 @@ function nativeToolRequiresApproval(input: {
   return kind === 'edit' || kind === 'bash';
 }
 
+/**
+ * The host-executed tools of a `start` as an in-process MCP server. Each call
+ * is surfaced as a `tool-call` and blocks on the host's `tool-result`.
+ */
+function createHostToolsServer(input: {
+  tools: NonNullable<StartMessage['tools']>;
+  emit: Emit;
+  requestToolResult: BridgeTurn['requestToolResult'];
+}): Record<string, unknown> {
+  const server = new mcpModule.McpServer({
+    name: 'harness-tools',
+    version: '1.0.0',
+  });
+  for (const tool of input.tools) {
+    server.registerTool(
+      tool.name,
+      {
+        description: tool.description ?? '',
+        inputSchema: jsonSchemaToZodObject(tool.inputSchema),
+      },
+      async (
+        ...handlerArgs: [
+          Record<string, unknown>,
+          { requestId: string | number; _meta?: Record<string, unknown> },
+        ]
+      ) => {
+        const [toolInput, extra] = handlerArgs;
+        const metadataToolCallId = extra._meta?.['claudecode/toolUseId'];
+        const toolCallId =
+          typeof metadataToolCallId === 'string'
+            ? metadataToolCallId
+            : randomUUID();
+        input.emit({
+          type: 'tool-call',
+          toolCallId,
+          toolName: tool.name,
+          input: JSON.stringify(toolInput),
+          providerExecuted: false,
+        });
+        const { output, isError } = await input.requestToolResult(toolCallId);
+        input.emit({
+          type: 'tool-result',
+          toolCallId,
+          toolName: tool.name,
+          result: output ?? null,
+          isError: !!isError,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output ?? null) }],
+          isError,
+        };
+      },
+    );
+  }
+  return { type: 'sdk', name: 'harness-tools', instance: server };
+}
+
+/**
+ * The Agent SDK options for a query driven by `start`. `turn` and `emit` back
+ * the host round trips (approvals, questions, host tools); a persistent query
+ * passes handles that route to whichever turn is active when they fire.
+ */
+function createQueryOptions(input: {
+  start: StartMessage;
+  firstTurn: boolean;
+  turn: Pick<BridgeTurn, 'requestToolApproval' | 'requestToolResult'>;
+  emit: Emit;
+  state: ClaudeStreamEventState;
+  onCompactSummary: (summary: string) => void;
+  abortSignal: AbortSignal;
+}): Record<string, unknown> {
+  const { start, turn, emit, state } = input;
+  const mcpServers: Record<string, unknown> = { ...start.mcpServers };
+  if (start.tools && start.tools.length > 0) {
+    mcpServers['harness-tools'] = createHostToolsServer({
+      tools: start.tools,
+      emit,
+      requestToolResult: turn.requestToolResult,
+    });
+  }
+  const skillsOption = toClaudeSkillsOption(start.skills);
+  const nativeTools = resolveNativeTools(start.builtinToolFiltering);
+  const inactiveNativeTools = resolveInactiveNativeTools(
+    start.builtinToolFiltering,
+  );
+  const permissionOptions = createPermissionOptions({
+    start,
+    inactiveNativeTools,
+    turn,
+    emit,
+    finishApprovalStep: approvalId => {
+      finishApprovalStep({ state, emit, approvalId });
+    },
+    nativeToolCallNames: state.nativeToolCallNames,
+    approvalRequestedToolUseIds: state.approvalRequestedToolUseIds,
+  });
+  const questionPreToolUseHook = createQuestionPreToolUseHook({
+    turn,
+    emit,
+    nativeToolCallNames: state.nativeToolCallNames,
+  });
+
+  return {
+    ...(start.model ? { model: start.model } : {}),
+    ...(start.maxTurns !== undefined ? { maxTurns: start.maxTurns } : {}),
+    ...(start.agentProgressSummaries !== undefined
+      ? { agentProgressSummaries: start.agentProgressSummaries }
+      : {}),
+    ...(start.forwardSubagentText !== undefined
+      ? { forwardSubagentText: start.forwardSubagentText }
+      : {}),
+    ...(start.env !== undefined ? { env: { ...procEnv, ...start.env } } : {}),
+    ...(skillsOption ? { skills: skillsOption } : {}),
+    ...(nativeTools !== undefined ? { tools: nativeTools } : {}),
+    ...(inactiveNativeTools.length > 0
+      ? { disallowedTools: inactiveNativeTools }
+      : {}),
+    systemPrompt: createClaudeCodeSystemPrompt(start.instructions),
+    thinking: start.thinking,
+    ...(start.effort !== undefined ? { effort: start.effort } : {}),
+    ...(start.responseFormat?.type === 'json' &&
+    start.responseFormat.schema != null
+      ? {
+          outputFormat: {
+            type: 'json_schema' as const,
+            schema: start.responseFormat.schema,
+          },
+        }
+      : {}),
+    includePartialMessages: true,
+    // The `PostCompact` hook carries the compaction summary, which the
+    // `compact_boundary` system message does not. Latch it for the unified
+    // `compaction` event; return an empty output so compaction proceeds.
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: 'AskUserQuestion',
+          hooks: [questionPreToolUseHook],
+        },
+      ],
+      PostCompact: [
+        {
+          hooks: [
+            async (hookInput: { compact_summary?: unknown }) => {
+              if (typeof hookInput?.compact_summary === 'string') {
+                input.onCompactSummary(hookInput.compact_summary);
+              }
+              return {};
+            },
+          ],
+        },
+      ],
+    },
+    // Continuation rule, most specific first.
+    //
+    // `resumeSessionId` names the exact conversation and is what a
+    // cross-process resume should use: `continue` means "most recent thread
+    // in this workdir", which silently picks the wrong one once anything
+    // else has run there. The bridge also retains the id observed during its
+    // previous query, so every later query stays pinned to that conversation
+    // even when the host detached and reattached between turns. `resume` and
+    // `continue` are mutually exclusive in the SDK.
+    //
+    // Otherwise the host can force-continue by setting `start.continue`,
+    // and turns after the first fall back to the legacy cwd-based behavior
+    // when no exact id was observed.
+    ...((start.resumeSessionId ?? lastClaudeSessionId)
+      ? { resume: start.resumeSessionId ?? lastClaudeSessionId }
+      : start.continue === true || !input.firstTurn
+        ? { continue: true }
+        : {}),
+    ...permissionOptions,
+    mcpServers,
+    cwd: workdir,
+    abortSignal: input.abortSignal,
+  };
+}
+
 async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
   const emit: Emit = msg => turn.emit(msg as BridgeEvent);
 
@@ -390,60 +594,6 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
 
   const streamEventState = createClaudeStreamEventState();
 
-  const mcpServers: Record<string, unknown> = { ...start.mcpServers };
-  if (start.tools && start.tools.length > 0) {
-    const server = new mcpModule.McpServer({
-      name: 'harness-tools',
-      version: '1.0.0',
-    });
-    for (const tool of start.tools) {
-      server.registerTool(
-        tool.name,
-        {
-          description: tool.description ?? '',
-          inputSchema: jsonSchemaToZodObject(tool.inputSchema),
-        },
-        async (
-          ...handlerArgs: [
-            Record<string, unknown>,
-            { requestId: string | number; _meta?: Record<string, unknown> },
-          ]
-        ) => {
-          const [input, extra] = handlerArgs;
-          const metadataToolCallId = extra._meta?.['claudecode/toolUseId'];
-          const toolCallId =
-            typeof metadataToolCallId === 'string'
-              ? metadataToolCallId
-              : randomUUID();
-          emit({
-            type: 'tool-call',
-            toolCallId,
-            toolName: tool.name,
-            input: JSON.stringify(input),
-            providerExecuted: false,
-          });
-          const { output, isError } = await turn.requestToolResult(toolCallId);
-          emit({
-            type: 'tool-result',
-            toolCallId,
-            toolName: tool.name,
-            result: output ?? null,
-            isError: !!isError,
-          });
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output ?? null) }],
-            isError,
-          };
-        },
-      );
-    }
-    mcpServers['harness-tools'] = {
-      type: 'sdk',
-      name: 'harness-tools',
-      instance: server,
-    };
-  }
-
   // Compaction observation: merge Claude's `compact_boundary` message and
   // `PostCompact` hook (which arrive in either order) into one `compaction`
   // event. See `createCompactionLatch`.
@@ -457,104 +607,18 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
     userMessages: turn.experimental_userMessages,
     abortSignal: abortCtl.signal,
   });
-  const skillsOption = toClaudeSkillsOption(start.skills);
-  const nativeTools = resolveNativeTools(start.builtinToolFiltering);
-  const inactiveNativeTools = resolveInactiveNativeTools(
-    start.builtinToolFiltering,
-  );
-  const permissionOptions = createPermissionOptions({
-    start,
-    inactiveNativeTools,
-    turn,
-    emit,
-    finishApprovalStep: approvalId => {
-      finishApprovalStep({ state: streamEventState, emit, approvalId });
-    },
-    nativeToolCallNames: streamEventState.nativeToolCallNames,
-    approvalRequestedToolUseIds: streamEventState.approvalRequestedToolUseIds,
-  });
-  const questionPreToolUseHook = createQuestionPreToolUseHook({
-    turn,
-    emit,
-    nativeToolCallNames: streamEventState.nativeToolCallNames,
-  });
 
   const q = claudeSdk.query({
     prompt: queryInput.input,
-    options: {
-      ...(start.model ? { model: start.model } : {}),
-      ...(start.maxTurns !== undefined ? { maxTurns: start.maxTurns } : {}),
-      ...(start.agentProgressSummaries !== undefined
-        ? { agentProgressSummaries: start.agentProgressSummaries }
-        : {}),
-      ...(start.forwardSubagentText !== undefined
-        ? { forwardSubagentText: start.forwardSubagentText }
-        : {}),
-      ...(start.env !== undefined ? { env: { ...procEnv, ...start.env } } : {}),
-      ...(skillsOption ? { skills: skillsOption } : {}),
-      ...(nativeTools !== undefined ? { tools: nativeTools } : {}),
-      ...(inactiveNativeTools.length > 0
-        ? { disallowedTools: inactiveNativeTools }
-        : {}),
-      systemPrompt: createClaudeCodeSystemPrompt(start.instructions),
-      thinking: start.thinking,
-      ...(start.effort !== undefined ? { effort: start.effort } : {}),
-      ...(start.responseFormat?.type === 'json' &&
-      start.responseFormat.schema != null
-        ? {
-            outputFormat: {
-              type: 'json_schema' as const,
-              schema: start.responseFormat.schema,
-            },
-          }
-        : {}),
-      includePartialMessages: true,
-      // The `PostCompact` hook carries the compaction summary, which the
-      // `compact_boundary` system message does not. Latch it for the unified
-      // `compaction` event; return an empty output so compaction proceeds.
-      hooks: {
-        PreToolUse: [
-          {
-            matcher: 'AskUserQuestion',
-            hooks: [questionPreToolUseHook],
-          },
-        ],
-        PostCompact: [
-          {
-            hooks: [
-              async (input: { compact_summary?: unknown }) => {
-                if (typeof input?.compact_summary === 'string') {
-                  compaction.onSummary(input.compact_summary);
-                }
-                return {};
-              },
-            ],
-          },
-        ],
-      },
-      // Continuation rule, most specific first.
-      //
-      // `resumeSessionId` names the exact conversation and is what a
-      // cross-process resume should use: `continue` means "most recent thread
-      // in this workdir", which silently picks the wrong one once anything
-      // else has run there. The bridge also retains the id observed during its
-      // previous query, so every later query stays pinned to that conversation
-      // even when the host detached and reattached between turns. `resume` and
-      // `continue` are mutually exclusive in the SDK.
-      //
-      // Otherwise the host can force-continue by setting `start.continue`,
-      // and turns after the first fall back to the legacy cwd-based behavior
-      // when no exact id was observed.
-      ...((start.resumeSessionId ?? lastClaudeSessionId)
-        ? { resume: start.resumeSessionId ?? lastClaudeSessionId }
-        : start.continue === true || !turn.firstTurn
-          ? { continue: true }
-          : {}),
-      ...permissionOptions,
-      mcpServers,
-      cwd: workdir,
+    options: createQueryOptions({
+      start,
+      firstTurn: turn.firstTurn,
+      turn,
+      emit,
+      state: streamEventState,
+      onCompactSummary: summary => compaction.onSummary(summary),
       abortSignal: abortCtl.signal,
-    },
+    }),
   });
 
   gracefulAbort = () => {
@@ -749,6 +813,517 @@ async function runTurn(start: StartMessage, turn: BridgeTurn): Promise<void> {
         }
       : {}),
   });
+}
+
+type ClaudeQuery = AsyncIterable<ClaudeMessage> & {
+  interrupt?: () => Promise<unknown>;
+  close?: () => void;
+  return?: (value?: unknown) => Promise<unknown>;
+};
+
+/** One host turn served by the live query. */
+type PersistentTurn = {
+  turn: BridgeTurn;
+  emit: Emit;
+  /** The turn asked for structured output, which arrives on the result. */
+  jsonResponse: boolean;
+  emitStreamEvent: (message: ClaudeMessage) => void;
+  /** Client uuids of the user messages this turn sent: its prompt, then steering. */
+  messageIds: Set<string>;
+  submittedMessages: Map<string, Experimental_BridgeUserMessage>;
+  observedResult: boolean;
+  turnUsage: Record<string, unknown> | undefined;
+  totalCostUsd: number | undefined;
+  hardAbortTimer: ReturnType<typeof setTimeout> | undefined;
+  settled: boolean;
+  settle(): void;
+};
+
+type LiveQuery = {
+  /** The `start` options the query was opened with, minus per-turn fields. */
+  key: string;
+  query: ClaudeQuery;
+  input: PushableInput<unknown>;
+  abortController: AbortController;
+  state: ClaudeStreamEventState;
+  compaction: CompactionLatch;
+  current: PersistentTurn | undefined;
+  /** The runtime's event sink, for messages that arrive between turns. */
+  emit: Emit;
+  closed: boolean;
+};
+
+const HARD_ABORT_MS = 5000;
+
+/**
+ * The `start` fields a live query is bound to. Everything but the prompt and
+ * the continuation hints becomes a query option, so a turn that changes any of
+ * them needs a fresh query.
+ */
+function persistentQueryKey(start: StartMessage): string {
+  const {
+    type: _type,
+    prompt: _prompt,
+    resumeSessionId: _resumeSessionId,
+    continue: _continue,
+    debug: _debug,
+    ...options
+  } = start as StartMessage & { debug?: unknown };
+  return JSON.stringify(options);
+}
+
+/**
+ * Serve a turn from the live query, opening one first when there is none or
+ * the turn's options differ. The turn ends at the result that answers its
+ * prompt; the query, and any background work it runs, stays up for the next
+ * turn.
+ */
+async function runPersistentTurn(
+  start: StartMessage,
+  turn: BridgeTurn,
+): Promise<void> {
+  const key = persistentQueryKey(start);
+  if (liveQuery != null && (liveQuery.closed || liveQuery.key !== key)) {
+    closeLiveQuery();
+  }
+  // The host already settled an aborted turn; do not start work for it.
+  if (turn.abortSignal.aborted) return;
+  const live = liveQuery ?? openLiveQuery({ start, turn, key });
+  live.emit = msg => turn.emit(msg as BridgeEvent);
+
+  let finished!: () => void;
+  const done = new Promise<void>(resolve => {
+    finished = resolve;
+  });
+  {
+    const emit: Emit = msg => turn.emit(msg as BridgeEvent);
+    const onHostAbort = (): void => interruptPersistentTurn(live, active);
+    const active: PersistentTurn = {
+      turn,
+      emit,
+      jsonResponse: start.responseFormat?.type === 'json',
+      emitStreamEvent: () => {},
+      messageIds: new Set(),
+      submittedMessages: new Map(),
+      observedResult: false,
+      turnUsage: undefined,
+      totalCostUsd: undefined,
+      hardAbortTimer: undefined,
+      settled: false,
+      settle: () => {
+        if (active.settled) return;
+        active.settled = true;
+        if (live.current === active) live.current = undefined;
+        turn.abortSignal.removeEventListener('abort', onHostAbort);
+        if (active.hardAbortTimer != null) clearTimeout(active.hardAbortTimer);
+        finished();
+      },
+    };
+    resetClaudeStreamEventTurnState(live.state);
+    active.emitStreamEvent = createEmitStreamEvent({
+      state: live.state,
+      emit,
+      emitWarning: turn.emitWarning,
+      emitTerminalError: message =>
+        failPersistentTurn(live, active, message, { fatal: true }),
+      onCompactionBoundary: boundary => live.compaction.onBoundary(boundary),
+      toCommonName,
+    });
+    live.current = active;
+    turn.abortSignal.addEventListener('abort', onHostAbort, { once: true });
+    void forwardSteering(live, active);
+
+    const promptId = randomUUID();
+    active.messageIds.add(promptId);
+    live.input.push(
+      toSdkUserMessage({ text: start.prompt, messageId: promptId }),
+    );
+    if (live.closed) {
+      turn.emitError({
+        error: new Error('Claude Code exited before the turn started.'),
+        message: 'claude-code turn failed',
+      });
+      active.settle();
+    }
+  }
+  await done;
+}
+
+function openLiveQuery(input: {
+  start: StartMessage;
+  turn: BridgeTurn;
+  key: string;
+}): LiveQuery {
+  const abortController = new AbortController();
+  const state = createClaudeStreamEventState();
+  const live: LiveQuery = {
+    key: input.key,
+    query: undefined as unknown as ClaudeQuery,
+    input: createPushableInput<unknown>(),
+    abortController,
+    state,
+    compaction: createCompactionLatch(event => live.current?.emit(event)),
+    current: undefined,
+    emit: msg => input.turn.emit(msg as BridgeEvent),
+    closed: false,
+  };
+  // Host round trips go to whichever turn is active when they fire. A request
+  // between turns (a background subagent asking for approval, say) has no host
+  // to answer it, so it is refused.
+  const routedTurn: Pick<
+    BridgeTurn,
+    'requestToolApproval' | 'requestToolResult'
+  > = {
+    requestToolApproval: approvalId =>
+      live.current != null
+        ? live.current.turn.requestToolApproval(approvalId)
+        : Promise.resolve({
+            approved: false,
+            reason: 'No turn is active to approve this tool call.',
+          }),
+    requestToolResult: request =>
+      live.current != null
+        ? live.current.turn.requestToolResult(request)
+        : Promise.resolve({
+            output: 'No turn is active to run this tool.',
+            isError: true,
+          }),
+  };
+  live.query = claudeSdk.query({
+    prompt: live.input,
+    options: createQueryOptions({
+      start: input.start,
+      firstTurn: input.turn.firstTurn,
+      turn: routedTurn,
+      emit: msg => live.current?.emit(msg),
+      state,
+      onCompactSummary: summary => live.compaction.onSummary(summary),
+      abortSignal: abortController.signal,
+    }),
+  }) as ClaudeQuery;
+  liveQuery = live;
+  void pumpLiveQuery(live);
+  return live;
+}
+
+/** Route every message of the live query, for as long as it runs. */
+async function pumpLiveQuery(live: LiveQuery): Promise<void> {
+  let failure: unknown;
+  try {
+    for await (const msg of live.query) {
+      if (live.closed) break;
+      const sessionId = (msg as { session_id?: unknown }).session_id;
+      if (typeof sessionId === 'string' && sessionId.length > 0) {
+        lastClaudeSessionId = sessionId;
+      }
+      const active = live.current;
+      if (msg.type === 'command_lifecycle' && active != null) {
+        handleSteeringLifecycle(active, msg);
+      }
+      if (active == null) {
+        forwardBetweenTurns(live, msg);
+        continue;
+      }
+      handlePersistentMessage(live, active, msg);
+    }
+  } catch (err) {
+    failure = err;
+  } finally {
+    live.closed = true;
+    live.input.close();
+    if (liveQuery === live) liveQuery = undefined;
+    const active = live.current;
+    if (active != null && !active.settled) {
+      if (!active.turn.abortSignal.aborted) {
+        active.turn.emitError({
+          error:
+            failure ??
+            new Error('Claude Code exited before the turn finished.'),
+          message: 'claude-code turn failed',
+        });
+      }
+      active.settle();
+    }
+  }
+}
+
+/**
+ * Between turns the query keeps running: background shells finish, subagents
+ * report, and the CLI may answer a task notification on its own. Each message
+ * goes to the host as a `raw` part (partial stream events excepted), never as
+ * a regular stream part, which would read as part of the next turn.
+ */
+function forwardBetweenTurns(live: LiveQuery, msg: ClaudeMessage): void {
+  if (msg.type === 'stream_event') return;
+  live.emit({ type: 'raw', rawValue: msg });
+}
+
+function handlePersistentMessage(
+  live: LiveQuery,
+  active: PersistentTurn,
+  msg: ClaudeMessage,
+): void {
+  // An interrupted turn ends at the result the interrupt produces.
+  if (msg.type === 'result' && active.turn.abortSignal.aborted) {
+    active.settle();
+    return;
+  }
+
+  active.emitStreamEvent(msg);
+  if (active.settled) return;
+
+  if (msg.type !== 'result') {
+    if (active.observedResult && !hasActiveSteering(active)) {
+      finishPersistentTurn(live, active);
+    }
+    return;
+  }
+
+  // A result for a turn the CLI started itself (answering a background task
+  // notification while this turn's prompt waited in its queue) is not ours.
+  if (!resultAnswersTurn(active, msg)) return;
+
+  if (msg.subtype !== 'success') {
+    failPersistentTurn(
+      live,
+      active,
+      (Array.isArray(msg.errors) ? msg.errors.join('\n') : undefined) ||
+        live.state.observedTerminalError ||
+        msg.result ||
+        'Unknown error',
+      { fatal: false },
+    );
+    return;
+  }
+  if (msg.is_error) {
+    failPersistentTurn(
+      live,
+      active,
+      msg.result?.trim() ||
+        live.state.observedTerminalError ||
+        (typeof msg.api_error_status === 'number'
+          ? `Claude Code reported an API error (HTTP ${msg.api_error_status})`
+          : 'Claude Code reported a failed result'),
+      { fatal: false },
+    );
+    return;
+  }
+  if (!msg.result?.trim?.() && live.state.observedTerminalError) {
+    failPersistentTurn(live, active, live.state.observedTerminalError, {
+      fatal: false,
+    });
+    return;
+  }
+  const harnessUsage = mapUsage(msg.usage ?? msg.message?.usage);
+  if (harnessUsage) active.turnUsage = addUsage(active.turnUsage, harnessUsage);
+  if (typeof msg.total_cost_usd === 'number') {
+    active.totalCostUsd = msg.total_cost_usd;
+  }
+  if (active.jsonResponse && msg.structured_output !== undefined) {
+    const id = randomUUID();
+    active.emit({ type: 'text-start', id });
+    active.emit({
+      type: 'text-delta',
+      id,
+      delta: JSON.stringify(msg.structured_output),
+    });
+    active.emit({ type: 'text-end', id });
+    live.state.stepOpen = true;
+  }
+  if (live.state.stepOpen) {
+    emitFinishStep({
+      state: live.state,
+      emit: active.emit,
+      usage: live.state.pendingStepUsage ?? harnessUsage,
+    });
+  }
+  active.observedResult = true;
+  if (!hasActiveSteering(active)) finishPersistentTurn(live, active);
+}
+
+/**
+ * Whether a result answers this turn. Current CLIs name the user messages a
+ * result consumed; a result naming none of this turn's, while user sends are
+ * still queued, belongs to a turn the CLI started on its own. A result that
+ * names nothing (older CLIs) is taken as this turn's.
+ */
+function resultAnswersTurn(
+  active: PersistentTurn,
+  msg: ClaudeMessage,
+): boolean {
+  const result = msg as ClaudeMessage & {
+    user_message_uuid?: unknown;
+    user_message_uuids?: unknown;
+    queued_turn_count?: unknown;
+  };
+  const ids = Array.isArray(result.user_message_uuids)
+    ? result.user_message_uuids.filter(
+        (id): id is string => typeof id === 'string',
+      )
+    : typeof result.user_message_uuid === 'string'
+      ? [result.user_message_uuid]
+      : [];
+  if (ids.length === 0) return true;
+  if (ids.some(id => active.messageIds.has(id))) return true;
+  return !(
+    typeof result.queued_turn_count === 'number' && result.queued_turn_count > 0
+  );
+}
+
+function hasActiveSteering(active: PersistentTurn): boolean {
+  return (
+    active.submittedMessages.size > 0 ||
+    active.turn.experimental_userMessages.pendingCount > 0
+  );
+}
+
+function finishPersistentTurn(live: LiveQuery, active: PersistentTurn): void {
+  if (active.settled) return;
+  active.emit({
+    type: 'finish',
+    finishReason: { unified: 'stop', raw: 'stop' },
+    totalUsage: active.turnUsage ?? live.state.stepUsage ?? defaultUsage(),
+    ...(active.totalCostUsd !== undefined || lastClaudeSessionId !== undefined
+      ? {
+          harnessMetadata: {
+            'claude-code': {
+              ...(active.totalCostUsd !== undefined
+                ? { costUsd: active.totalCostUsd }
+                : {}),
+              ...(lastClaudeSessionId !== undefined
+                ? { sessionId: lastClaudeSessionId }
+                : {}),
+            },
+          },
+        }
+      : {}),
+  });
+  active.settle();
+}
+
+/**
+ * End the turn with an error. A failed result leaves the CLI ready for the
+ * next turn, so the query stays up; a fatal stream error (rejected
+ * credentials, an unrecoverable API status) closes it, and the next turn
+ * resumes the conversation in a fresh one.
+ */
+function failPersistentTurn(
+  live: LiveQuery,
+  active: PersistentTurn,
+  message: string | undefined,
+  { fatal }: { fatal: boolean },
+): void {
+  const normalized = message?.trim();
+  if (!normalized || active.settled) return;
+  live.state.observedTerminalError = normalized;
+  // The host's own stop ends with an error-shaped result; it is not a fault.
+  if (!active.turn.abortSignal.aborted) {
+    active.turn.emitError({
+      error: normalized,
+      message: 'claude-code terminal error',
+    });
+  }
+  active.settle();
+  if (fatal) closeLiveQuery(live);
+}
+
+/**
+ * A host stop interrupts the CLI's current turn (Esc semantics), which keeps
+ * the process and its background work. If the interrupt does not settle the
+ * turn in time, the query is closed instead.
+ */
+function interruptPersistentTurn(
+  live: LiveQuery,
+  active: PersistentTurn,
+): void {
+  if (active.settled) return;
+  active.hardAbortTimer = setTimeout(() => closeLiveQuery(live), HARD_ABORT_MS);
+  active.hardAbortTimer.unref?.();
+  void Promise.resolve()
+    .then(() => live.query.interrupt?.())
+    .catch(() => closeLiveQuery(live));
+}
+
+async function forwardSteering(
+  live: LiveQuery,
+  active: PersistentTurn,
+): Promise<void> {
+  for await (const message of active.turn.experimental_userMessages) {
+    if (active.settled || live.closed) {
+      message.reject(
+        new Error('The bridge turn ended before accepting the user message.'),
+      );
+      continue;
+    }
+    active.submittedMessages.set(message.messageId, message);
+    active.messageIds.add(message.messageId);
+    live.input.push(
+      toSdkUserMessage({
+        text: message.text,
+        messageId: message.messageId,
+        priority: 'next',
+      }),
+    );
+  }
+}
+
+function handleSteeringLifecycle(
+  active: PersistentTurn,
+  message: ClaudeMessage,
+): void {
+  const lifecycle = message as ClaudeMessage & {
+    command_uuid?: string;
+    state?: 'queued' | 'started' | 'completed' | 'cancelled' | 'discarded';
+  };
+  if (lifecycle.command_uuid == null || lifecycle.state == null) return;
+  const submitted = active.submittedMessages.get(lifecycle.command_uuid);
+  if (submitted == null) return;
+  if (lifecycle.state === 'queued' || lifecycle.state === 'started') {
+    submitted.accept();
+    return;
+  }
+  if (lifecycle.state === 'cancelled' || lifecycle.state === 'discarded') {
+    submitted.reject(
+      new Error(`Claude Code ${lifecycle.state} the user message.`),
+    );
+  }
+  active.submittedMessages.delete(lifecycle.command_uuid);
+}
+
+/** Close the live query and its CLI process, ending any background work. */
+function closeLiveQuery(live: LiveQuery | undefined = liveQuery): void {
+  if (live == null) return;
+  if (liveQuery === live) liveQuery = undefined;
+  if (live.closed) return;
+  live.closed = true;
+  live.input.close();
+  live.abortController.abort();
+  try {
+    if (live.query.close != null) {
+      live.query.close();
+    } else {
+      void live.query.return?.(undefined)?.catch(() => {});
+    }
+  } catch {
+    // Best effort; the abort tears the process down otherwise.
+  }
+}
+
+function toSdkUserMessage(options: {
+  text: string;
+  messageId: string;
+  priority?: 'next';
+}): unknown {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'text', text: options.text }],
+    },
+    parent_tool_use_id: null,
+    uuid: options.messageId,
+    ...(options.priority == null ? {} : { priority: options.priority }),
+  };
 }
 
 function createQueryInput({
